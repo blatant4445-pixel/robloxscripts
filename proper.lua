@@ -1,10 +1,11 @@
--- PartFlingerServer — LinoriaLib Version (debug nuke, no CFrame teleport)
--- Requires executor context for loadstring/HttpGet.
+-- PartFlingerClient — LinoriaLib Version (fixed)
+-- RUN THIS CLIENT-SIDE (executor)
 
 local Players     = game:GetService("Players")
 local RunService  = game:GetService("RunService")
 local UserInput   = game:GetService("UserInputService")
 local Workspace   = workspace
+local LocalPlayer = Players.LocalPlayer
 
 -- ============================================================
 -- CONFIG
@@ -25,9 +26,9 @@ local CFG = {
     NukeOrbitTime = 2.5,
     NukeRadius    = 250,
     NukeOrbitSpeed = 200,
-    NukeSlamForce = 500,   -- much smaller than before; no teleport
+    NukeSlamForce = 500,
     RequireAdmin  = false,
-    Admins        = { --[[ 123456789, ]] },
+    Admins        = {},
 }
 
 local META = {
@@ -69,12 +70,29 @@ end
 -- ============================================================
 -- STATE
 -- ============================================================
-local P = {}   -- [player] = {state, target, ui, nukeArmed}
+local uiBuilt = {}
+local sliderRefs = {}
+local entry = nil
 
-local function isAdmin(plr)
-    if not CFG.RequireAdmin then return true end
-    for _, id in ipairs(CFG.Admins) do if plr.UserId == id then return true end end
-    return false
+-- ============================================================
+-- LOAD LINORIALIB
+-- ============================================================
+local repo = 'https://raw.githubusercontent.com/violin-suzutsuki/LinoriaLib/main/'
+local Library
+do
+    local code = game:HttpGet(repo .. 'Library.lua')
+    local func, err = loadstring(code)
+    if not func then error("[PartFlinger] loadstring failed: "..tostring(err)) end
+    Library = func()
+end
+if not Library then error("[PartFlinger] Could not load LinoriaLib") end
+
+-- ============================================================
+-- HELPERS
+-- ============================================================
+local function getHrp(plr)
+    local ch = plr and plr.Character
+    return ch and ch:FindFirstChild("HumanoidRootPart") or nil
 end
 
 local function resolvePlayer(plr, txt)
@@ -97,37 +115,9 @@ local function alivePlayers()
     return t
 end
 
-local function getHrp(plr)
-    local ch = plr and plr.Character
-    return ch and ch:FindFirstChild("HumanoidRootPart") or nil
-end
-
--- ============================================================
--- LOAD LINORIALIB
--- ============================================================
-local repo = 'https://raw.githubusercontent.com/violin-suzutsuki/LinoriaLib/main/'
-
-local function safeloadstring(url)
-    local code = game:HttpGet(url)
-    local func, err = loadstring(code)
-    if func then
-        print("[PartFlinger] LinoriaLib compiled, executing...")
-        return func()
-    else
-        warn("[PartFlinger] LOADSTRING FAILED: " .. tostring(err))
-        return nil
-    end
-end
-
-local Library = safeloadstring(repo .. 'Library.lua')
-if not Library then error("Could not load LinoriaLib") end
-
--- ============================================================
--- PHYSICS HELPERS
--- ============================================================
 local function capVel(v)
     local mag = v.Magnitude
-    if mag ~= mag then return Vector3.zero end  -- NaN guard
+    if mag ~= mag then return Vector3.zero end
     if mag > CFG.VelocityCap then return v.Unit * CFG.VelocityCap end
     return v
 end
@@ -141,7 +131,7 @@ local function betterFling(part, fromPos, refVel)
     part.AssemblyLinearVelocity = capVel(v)
     local spin = CFG.FlingSpin
     part.AssemblyAngularVelocity = Vector3.new(
-        math.random(-spin, spin), math.random(-spin, spin), math.random(-spin, spin)
+        (math.random()*2-1)*spin, (math.random()*2-1)*spin, (math.random()*2-1)*spin
     )
     if not part.CanCollide then part.CanCollide = true end
 end
@@ -162,6 +152,7 @@ local function bringPart(part, hrp)
     end
 end
 
+-- Cache part scans per frame to avoid redundant GetDescendants
 local function nearbyUnanchoredParts(origin, radius, limit)
     local out = {}
     local radiusSq = radius * radius
@@ -180,57 +171,36 @@ local function nearbyUnanchoredParts(origin, radius, limit)
 end
 
 -- ============================================================
--- CURSOR HELPERS
+-- CURSOR
 -- ============================================================
-local function getCursorWorldPoint(plr, ignoreList)
+local function getCursorWorldPoint(ignoreList)
     local camera = Workspace.CurrentCamera
-    if not camera then
-        print("[Nuke] No camera")
-        return nil
-    end
-
+    if not camera then return nil end
     local screenPoint
     if UserInput.MouseEnabled then
         screenPoint = UserInput:GetMouseLocation()
     else
         local vp = camera.ViewportSize
-        screenPoint = Vector2.new(vp.X / 2, vp.Y / 2)
+        screenPoint = Vector2.new(vp.X/2, vp.Y/2)
     end
-    print("[Nuke] screen point:", screenPoint)
-
     local ray = camera:ScreenPointToRay(screenPoint.X, screenPoint.Y)
     local params = RaycastParams.new()
     params.FilterType = Enum.RaycastFilterType.Exclude
     params.FilterDescendantsInstances = ignoreList or {}
     params.IgnoreWater = true
-
     local result = Workspace:Raycast(ray.Origin, ray.Direction * 5000, params)
-    if result and result.Position then
-        print("[Nuke] raycast hit:", result.Position, "part:", result.Instance and result.Instance:GetFullName())
-        return result.Position
-    end
-    print("[Nuke] raycast MISS")
-
-    local mouse = plr:GetMouse()
-    if mouse and mouse.Hit then
-        print("[Nuke] using mouse.Hit:", mouse.Hit.Position)
-        return mouse.Hit.Position
-    end
-    print("[Nuke] no fallback hit")
+    if result and result.Position then return result.Position end
     return nil
 end
 
 -- ============================================================
--- NUKE SEQUENCE (velocity-only, no CFrame teleport)
+-- NUKE
 -- ============================================================
--- Per-part orbit state: { part, center, angle, radius, speed, born, life, state, slamStart }
 local activeNukes = {}
 
 local function startNuke(origin)
     local parts = nearbyUnanchoredParts(origin, CFG.NukeRadius, math.huge)
-    print("[Nuke] found", #parts, "unanchored parts within", CFG.NukeRadius, "of", origin)
     if #parts == 0 then return 0 end
-
     local orbitTime  = CFG.NukeOrbitTime
     local orbitSpeed = CFG.NukeOrbitSpeed
     local center     = origin + Vector3.new(0, 10, 0)
@@ -241,9 +211,7 @@ local function startNuke(origin)
         local r     = math.max(flat.Magnitude, 4 + math.random() * 6)
         local ang   = math.atan2(delta.Z, delta.X) + math.random() * 0.4
         local h     = math.max(delta.Y, 2 + math.random() * 6)
-
         if not part.CanCollide then part.CanCollide = true end
-
         activeNukes[#activeNukes + 1] = {
             part    = part,
             center  = center,
@@ -255,16 +223,15 @@ local function startNuke(origin)
             life    = orbitTime,
             state   = "orbit",
             lastPos = part.Position,
+            stuckTime = 0,
         }
     end
-    print("[Nuke] launched", #activeNukes, "orbiters")
     return #parts
 end
 
 RunService.Heartbeat:Connect(function(dt)
     if #activeNukes == 0 then return end
     local now = os.clock()
-
     local i = 1
     while i <= #activeNukes do
         local n = activeNukes[i]
@@ -279,22 +246,22 @@ RunService.Heartbeat:Connect(function(dt)
             local t = math.clamp((now - n.born) / n.life, 0, 1)
             local height = n.height + 15 * t
             local target = n.center + Vector3.new(
-                math.cos(n.angle) * n.radius,
-                height,
-                math.sin(n.angle) * n.radius
+                math.cos(n.angle) * n.radius, height, math.sin(n.angle) * n.radius
             )
-            -- Velocity pulls toward the orbit target, but we do not teleport.
             local vel = (target - part.Position) * 4
             if vel.Magnitude > 300 then vel = vel.Unit * 300 end
             part.AssemblyLinearVelocity = vel
             part.AssemblyAngularVelocity = Vector3.new(n.speed, n.speed, 0)
 
-            -- If part has stopped responding (CFrame unchanged), bail out so
-            -- it does not keep "disappearing" into the void.
-            if (part.Position - n.lastPos).Magnitude < 0.05 and t > 0.2 then
-                print("[Nuke] part unresponsive, removing from orbit:", part:GetFullName())
-                table.remove(activeNukes, i)
-                continue
+            -- Only bail if stuck for a sustained time (was too aggressive before)
+            if (part.Position - n.lastPos).Magnitude < 0.1 then
+                n.stuckTime = n.stuckTime + dt
+                if n.stuckTime > 0.5 then
+                    table.remove(activeNukes, i)
+                    continue
+                end
+            else
+                n.stuckTime = 0
             end
             n.lastPos = part.Position
 
@@ -303,7 +270,6 @@ RunService.Heartbeat:Connect(function(dt)
                 n.slamStart = now
                 part.AssemblyLinearVelocity = Vector3.new(0, -CFG.NukeSlamForce, 0)
                 part.AssemblyAngularVelocity = Vector3.zero
-                print("[Nuke] slam:", part:GetFullName())
             end
         elseif n.state == "slam" then
             local elapsed = now - n.slamStart
@@ -315,18 +281,15 @@ RunService.Heartbeat:Connect(function(dt)
                 continue
             end
         end
-
         i += 1
     end
 end)
 
 -- ============================================================
--- BUILD UI
+-- UI
 -- ============================================================
-local uiBuilt = {}
-
 local function buildUI(plr)
-    if uiBuilt[plr] then return P[plr] end
+    if uiBuilt[plr] then return entry end
     uiBuilt[plr] = true
 
     local Window = Library:CreateWindow({
@@ -344,9 +307,8 @@ local function buildUI(plr)
     }
 
     local state = {fling=false, bring=false, fly=false, multi=false, others=false}
-    local entry = {state=state, target=nil, ui=Window, nukeArmed=false}
+    entry = {state=state, target=nil, ui=Window, nukeArmed=false}
 
-    -- ===== Status groupbox (isolated so it can't overlap anything) =====
     local statusBox = Tabs.Controls:AddLeftGroupbox('Status')
     local statusLabel = statusBox:AddLabel('Target = self | idle')
 
@@ -366,7 +328,6 @@ local function buildUI(plr)
         statusLabel:SetText('Target = ' .. tgt .. ' | ' .. modeStr)
     end
 
-    -- ===== Target groupbox (input only, no label above it) =====
     local targetBox = Tabs.Controls:AddRightGroupbox('Target')
     targetBox:AddInput('PF_Target', {
         Default = '',
@@ -381,7 +342,6 @@ local function buildUI(plr)
         end,
     })
 
-    -- ===== Modes =====
     local modeBox = Tabs.Controls:AddLeftGroupbox('Modes')
     local switching = false
     local function onMode(k, newVal)
@@ -406,20 +366,16 @@ local function buildUI(plr)
             fling = 'Fling parts around your target',
             bring = 'Pull parts toward your target',
             fly = 'Launch parts under your target',
-            multi = 'Apply fling/bring/fly to EVERYONE (including you)',
-            others = 'Apply fling/bring/fly to everyone EXCEPT you',
+            multi = 'Apply to EVERYONE (including you)',
+            others = 'Apply to everyone EXCEPT you',
         })[k] or ''
         modeBox:AddToggle('PF_Mode_' .. k, {
-            Text = k:upper(),
-            Default = false,
-            Tooltip = tooltip,
+            Text = k:upper(), Default = false, Tooltip = tooltip,
         })
         Toggles['PF_Mode_' .. k]:OnChanged(function(v) onMode(k, v) end)
     end
 
-    -- ===== Actions =====
     local actionBox = Tabs.Controls:AddRightGroupbox('Actions')
-
     actionBox:AddButton('STOP ALL', function()
         for _, m in ipairs(MODE_KEYS) do
             state[m] = false
@@ -430,68 +386,36 @@ local function buildUI(plr)
         Library:Notify('Stopped', 2)
     end)
 
-    local nukeToggle
-    nukeToggle = actionBox:AddToggle('PF_NukeArmed', {
+    local nukeToggle = actionBox:AddToggle('PF_NukeArmed', {
         Text = 'NUKE ARM',
         Default = false,
-        Tooltip = 'While armed, click any part in the world. Nearby parts orbit, then slam down.',
+        Tooltip = 'While armed, click any part. Nearby parts orbit, then slam down.',
         Callback = function(v)
             entry.nukeArmed = v
-            print("[Nuke] armed =", v)
             if v then Library:Notify('Nuke armed — click a part', 2) end
         end,
     })
 
-    -- Primary click detector: Mouse.Button1Down (fires reliably in executors)
-    local mouse = plr:GetMouse()
-    if mouse then
-        mouse.Button1Down:Connect(function()
-            print("[Nuke] Button1Down fired, armed =", entry.nukeArmed)
-            if not entry.nukeArmed then return end
-
-            local myChar = plr.Character
-            local origin = getCursorWorldPoint(plr, myChar and {myChar} or {})
-            if not origin then
-                Library:Notify('Nuke: could not resolve world point', 2)
-                return
-            end
-
-            local count = startNuke(origin)
-            Library:Notify(string.format('Nuke: %d parts orbiting', count), 2)
-
-            entry.nukeArmed = false
-            if nukeToggle then nukeToggle:SetValue(false) end
-        end)
-    else
-        print("[Nuke] player:GetMouse() returned nil — will rely on InputBegan only")
-    end
-
-    -- Fallback: InputBegan in case Button1Down doesn't fire
+    -- Single click detector (InputBegan handles both mouse & touch)
     UserInput.InputBegan:Connect(function(input, processed)
-        print("[Nuke] InputBegan: type =", input.UserInputType.Name, "| processed =", processed, "| armed =", entry.nukeArmed)
         if processed then return end
         if not entry.nukeArmed then return end
         if input.UserInputType ~= Enum.UserInputType.MouseButton1
             and input.UserInputType ~= Enum.UserInputType.Touch then return end
 
         local myChar = plr.Character
-        local origin = getCursorWorldPoint(plr, myChar and {myChar} or {})
+        local origin = getCursorWorldPoint(myChar and {myChar} or {})
         if not origin then
             Library:Notify('Nuke: could not resolve world point', 2)
             return
         end
-
         local count = startNuke(origin)
         Library:Notify(string.format('Nuke: %d parts orbiting', count), 2)
-
         entry.nukeArmed = false
         if nukeToggle then nukeToggle:SetValue(false) end
     end)
 
-    -- ===== Presets =====
     local presetBox = Tabs.Presets:AddLeftGroupbox('Presets')
-    local sliderRefs = {}
-
     for _, name in ipairs({'default','gentle','violent','fly'}) do
         presetBox:AddButton(name:upper() .. ' preset', function()
             applyPreset(name)
@@ -500,9 +424,7 @@ local function buildUI(plr)
         end)
     end
 
-    -- ===== Config =====
     local configBox = Tabs.Config:AddLeftGroupbox('Config Sliders')
-
     for _, key in ipairs({
         'FlingForce','FlingUp','FlingSpin','BringSpeed','TouchDistance',
         'MaxParts','MaxRange','FlyForce','FlyLift','NukeForce','VelocityCap',
@@ -513,8 +435,7 @@ local function buildUI(plr)
         configBox:AddSlider('PF_Cfg_' .. key, {
             Text = key,
             Default = CFG[key],
-            Min = lo,
-            Max = hi,
+            Min = lo, Max = hi,
             Rounding = rounding,
             Compact = false,
             Callback = function(v)
@@ -524,7 +445,6 @@ local function buildUI(plr)
         sliderRefs[key] = Options['PF_Cfg_' .. key]
     end
 
-    P[plr] = entry
     refreshStatus()
     return entry
 end
@@ -532,112 +452,97 @@ end
 -- ============================================================
 -- SETUP
 -- ============================================================
-local function setupPlayer(plr)
-    if not isAdmin(plr) then return end
-    buildUI(plr)
-end
-
-Players.PlayerAdded:Connect(setupPlayer)
-if #Players:GetPlayers() > 0 then
-    for _, p in ipairs(Players:GetPlayers()) do setupPlayer(p) end
-end
-Players.PlayerRemoving:Connect(function(p)
-    P[p] = nil
-    uiBuilt[p] = nil
-end)
+buildUI(LocalPlayer)
 
 -- ============================================================
--- MAIN LOOP (fling/bring/fly/multi/others)
+-- MAIN LOOP
 -- ============================================================
 local acc = 0
 RunService.Heartbeat:Connect(function(dt)
+    if not entry then return end
     acc += dt
     if acc < 1/30 then return end
     acc = 0
 
-    local alive    = alivePlayers()
+    local s = entry.state
+    if not (s.fling or s.bring or s.fly or s.multi or s.others) then return end
+
     local maxParts = CFG.MaxParts
     local maxRange = CFG.MaxRange
+    local owner = LocalPlayer
 
-    for owner, e in pairs(P) do
-        local s = e.state
-        if not (s.fling or s.bring or s.fly or s.multi or s.others) then continue end
+    local ref = entry.target
+    if ref and not ref.Parent then ref=nil; entry.target=nil end
 
-        local ref = e.target
-        if ref and not ref.Parent then ref=nil; e.target=nil end
-
-        if s.multi or s.others then
-            local recipients = {}
-            if s.multi then
-                recipients = alive
-            else
-                for _, p in ipairs(alive) do
-                    if p ~= owner then recipients[#recipients+1] = p end
-                end
+    if s.multi or s.others then
+        local alive = alivePlayers()
+        local recipients = {}
+        if s.multi then recipients = alive
+        else
+            for _, p in ipairs(alive) do
+                if p ~= owner then recipients[#recipients+1] = p end
             end
-
-            if #recipients > 0 then
-                local scanOrigin = getHrp(owner) or (getHrp(recipients[1]) or Vector3.zero)
-                local parts = nearbyUnanchoredParts(scanOrigin, maxRange, maxParts)
-                local i = 0
-                for _, obj in ipairs(parts) do
-                    local tries, targetHrp = 0, nil
-                    while tries < #recipients do
-                        i = (i % #recipients) + 1
-                        local h = getHrp(recipients[i])
-                        if h and (obj.Position - h.Position).Magnitude <= maxRange then
-                            targetHrp = h; break
-                        end
-                        tries += 1
-                    end
-                    if not targetHrp then continue end
-
-                    if s.fling then
-                        betterFling(obj, targetHrp.Position, targetHrp.AssemblyLinearVelocity)
-                    elseif s.bring then
-                        bringPart(obj, targetHrp)
-                    elseif s.fly then
-                        local d = obj.Position - targetHrp.Position
-                        if d.Y < 1 then
-                            if not obj.CanCollide then obj.CanCollide = true end
-                            obj.AssemblyLinearVelocity = Vector3.new(0, CFG.FlyForce, 0)
-                            local desired = Vector3.new(targetHrp.Position.X, targetHrp.Position.Y - CFG.FlyLift, targetHrp.Position.Z)
-                            if (desired - obj.Position).Magnitude > 8 then
-                                obj.CFrame = CFrame.new(desired)
-                            end
-                        end
-                    end
-                end
-            end
-            continue
         end
-
-        local targetHrp = getHrp(ref or owner)
-        if not targetHrp then continue end
-        local origin = targetHrp.Position
-
-        if s.fly then
-            local parts = nearbyUnanchoredParts(origin, maxRange, maxParts)
+        if #recipients > 0 then
+            local scanOrigin = getHrp(owner) or (getHrp(recipients[1]) or Vector3.zero)
+            local parts = nearbyUnanchoredParts(scanOrigin, maxRange, maxParts)
+            local i = 0
             for _, obj in ipairs(parts) do
-                if obj.Position.Y < origin.Y + 1 then
-                    if not obj.CanCollide then obj.CanCollide = true end
-                    obj.AssemblyLinearVelocity = Vector3.new(0, CFG.FlyForce, 0)
-                    local desired = Vector3.new(origin.X, origin.Y - CFG.FlyLift, origin.Z)
-                    if (desired - obj.Position).Magnitude > 8 then
-                        obj.CFrame = CFrame.new(desired)
+                local tries, targetHrp = 0, nil
+                while tries < #recipients do
+                    i = (i % #recipients) + 1
+                    local h = getHrp(recipients[i])
+                    if h and (obj.Position - h.Position).Magnitude <= maxRange then
+                        targetHrp = h; break
+                    end
+                    tries += 1
+                end
+                if not targetHrp then continue end
+                if s.fling then
+                    betterFling(obj, targetHrp.Position, targetHrp.AssemblyLinearVelocity)
+                elseif s.bring then
+                    bringPart(obj, targetHrp)
+                elseif s.fly then
+                    local d = obj.Position - targetHrp.Position
+                    if d.Y < 1 then
+                        if not obj.CanCollide then obj.CanCollide = true end
+                        obj.AssemblyLinearVelocity = Vector3.new(0, CFG.FlyForce, 0)
+                        local desired = Vector3.new(targetHrp.Position.X, targetHrp.Position.Y - CFG.FlyLift, targetHrp.Position.Z)
+                        if (desired - obj.Position).Magnitude > 8 then
+                            obj.CFrame = CFrame.new(desired)
+                        end
                     end
                 end
             end
-            continue
         end
+        return
+    end
 
+    local targetHrp = getHrp(ref or owner)
+    if not targetHrp then return end
+    local origin = targetHrp.Position
+
+    if s.fly then
         local parts = nearbyUnanchoredParts(origin, maxRange, maxParts)
         for _, obj in ipairs(parts) do
-            if s.fling then
-                betterFling(obj, origin, targetHrp.AssemblyLinearVelocity)
-            elseif s.bring then
-                bringPart(obj, targetHrp)
+            if obj.Position.Y < origin.Y + 1 then
+                if not obj.CanCollide then obj.CanCollide = true end
+                obj.AssemblyLinearVelocity = Vector3.new(0, CFG.FlyForce, 0)
+                local desired = Vector3.new(origin.X, origin.Y - CFG.FlyLift, origin.Z)
+                if (desired - obj.Position).Magnitude > 8 then
+                    obj.CFrame = CFrame.new(desired)
+                end
             end
+        end
+        return
+    end
+
+    local parts = nearbyUnanchoredParts(origin, maxRange, maxParts)
+    for _, obj in ipairs(parts) do
+        if s.fling then
+            betterFling(obj, origin, targetHrp.AssemblyLinearVelocity)
+        elseif s.bring then
+            bringPart(obj, targetHrp)
         end
     end
 end)
