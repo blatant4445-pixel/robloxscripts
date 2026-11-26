@@ -1,6 +1,5 @@
 -- PartFlingerServer — SBEUI (Orbital UI) Version
 -- Requires executor context for loadstring/HttpGet (UI library limitation).
--- If you must run this on a real server, inject the library source via a string instead.
 
 local Players    = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -105,53 +104,106 @@ local UILibrary = safeloadstring(
 if not UILibrary then error("Could not load SBEUI library") end
 
 -- ============================================================
+-- PHYSICS HELPERS (defined early so UI callbacks can use them)
+-- ============================================================
+local function capVel(v)
+    if v.Magnitude > CFG.VelocityCap then return v.Unit * CFG.VelocityCap end
+    return v
+end
+
+local function betterFling(part, fromPos, refVel)
+    local delta = part.Position - fromPos
+    local dist = delta.Magnitude
+    local dir = (dist > 0.1) and delta.Unit or Vector3.new(0,1,0)
+    local relVel = (refVel or Vector3.zero) * 0.5
+    local v = dir * CFG.FlingForce
+        + Vector3.new(0, CFG.FlingUp, 0)
+        + relVel
+    part.AssemblyLinearVelocity = capVel(v)
+    part.AssemblyAngularVelocity = Vector3.new(
+        math.random()*CFG.FlingSpin,
+        math.random()*CFG.FlingSpin,
+        math.random()*CFG.FlingSpin
+    )
+    part.CanCollide = true
+end
+
+local function bringPart(part, hrp)
+    local delta = part.Position - hrp.Position
+    local dist = delta.Magnitude
+    part.CanCollide = true
+    if dist > CFG.TouchDistance then
+        part.AssemblyLinearVelocity = capVel((-delta).Unit * CFG.BringSpeed)
+        if CFG.SnapToTouch and dist < 30 then
+            part.CFrame = CFrame.new(hrp.Position + delta.Unit*CFG.TouchDistance) * part.CFrame.Rotation
+        end
+    else
+        local dir = (dist > 0.05) and delta.Unit or Vector3.new(0,1,0)
+        part.CFrame = CFrame.new(hrp.Position + dir*CFG.TouchDistance) * part.CFrame.Rotation
+        part.AssemblyLinearVelocity = hrp.AssemblyLinearVelocity
+    end
+end
+
+-- ============================================================
 -- BUILD UI FOR A PLAYER
 -- ============================================================
 local function buildUI(plr)
     local pg = plr:FindFirstChild("PlayerGui")
     if not pg then return nil end
 
-    -- Clean up old UI if present
+    -- Clean up any old PartFlinger UI instance if present
     local old = pg:FindFirstChild("PartFlingerGui")
     if old then old:Destroy() end
 
-    -- Build a fresh ScreenGui container for the library
-    -- local gui = Instance.new("ScreenGui")
-    -- gui.Name = "PartFlingerGui"
-    -- gui.ResetOnSpawn = false
-    -- gui.Parent = pg
+    local ok, ui = pcall(function()
+        return UILibrary.Main.new({
+            TitleText = "PART FLINGER",
+            Size = UDim2.new(0, 260, 0, 460),
+            Position = UDim2.new(0, 20, 0.5, -230),
+            SettingSize = UDim2.new(0, 260, 0, 260),
+            TitleHeight = 30,
+            CornerRadius = 6,
+            ElementPadding = 6,
+            Font = Enum.Font.GothamBold,
+            TextSize = 12,
+            SectionHeight = 20,
+            UIStrokeThickness = 1,
+            SliderColor = Color3.fromRGB(54, 54, 54),
+            NotifcationSound = "",
+            ResetOnSpawn = false,
+            Addons = {},
+            KeySystemEnabled = false,
+            TabPadding = 10,
+            UseOwnTheme = false,
+            Theme = "Blood Moon",
+            SaveOnExit = true,
+        })
+    end)
 
-    local ui = UILibrary.Main.new({
-        TitleText = "PART FLINGER",
-        Size = UDim2.new(0, 260, 0, 460),
-        Position = UDim2.new(0, 20, 0.5, -230),
-        SettingSize = UDim2.new(0, 260, 0, 260),
-        TitleHeight = 30,
-        CornerRadius = 6,
-        ElementPadding = 6,
-        Font = Enum.Font.GothamBold,
-        TextSize = 12,
-        SectionHeight = 20,
-        UIStrokeThickness = 1,
-        SliderColor = Color3.fromRGB(54, 54, 54),
-        NotifcationSound = "",
-        ResetOnSpawn = false,
-        Addons = {},
-        KeySystemEnabled = false,
-        TabPadding = 10,
-        UseOwnTheme = false,
-        Theme = "Blood Moon",
-        SaveOnExit = true,
-        Parent = gui, -- library accepts a Parent override for the ScreenGui
-    })
+    if not ok or not ui then
+        warn("[PartFlinger] Failed to create SBEUI window: " .. tostring(ui))
+        return nil
+    end
+
     ui:CreateUI()
 
+    -- Rename the library-created ScreenGui so we can find/clean it up later
+    local libGui
+    for _, child in ipairs(pg:GetChildren()) do
+        if child:IsA("ScreenGui") and child.Name ~= "PartFlingerGui" then
+            -- Heuristic: the newest ScreenGui is the one SBEUI just made
+            libGui = child
+        end
+    end
+    if libGui then libGui.Name = "PartFlingerGui" end
+
     local state = {fling=false, bring=false, fly=false, multi=false, others=false}
-    local entry = {state=state, target=nil, ui=ui, gui=gui}
+    local entry = {state=state, target=nil, ui=ui, libGui=libGui}
 
     -- -------- Target + Status --------
     ui:AddSection("Target")
-    local targetBox = ui:AddTextBox({
+    local targetBox
+    targetBox = ui:AddTextBox({
         Text = "Target username (blank = self)",
         Default = "",
         Placeholder = "username",
@@ -212,26 +264,27 @@ local function buildUI(plr)
 
     -- -------- Actions --------
     ui:AddSection("Actions")
-    local _stop = ui:AddToggle({
-        Text = "STOP ALL (click to disable)",
+
+    local stopToggle
+    stopToggle = ui:AddToggle({
+        Text = "STOP ALL",
         Default = false,
         Flag = "PF_StopAll",
         SavingEnabled = false,
         Callback = function(v)
-            if v then
-                for _, m in ipairs({"fling","bring","fly","multi","others"}) do
-                    state[m] = false
-                    if modeToggles[m] then modeToggles[m]:Set(false) end
-                end
-                refreshStatus()
-                -- auto-reset the stop toggle
-                task.delay(0.1, function() end)
+            if not v then return end
+            for _, m in ipairs({"fling","bring","fly","multi","others"}) do
+                state[m] = false
+                if modeToggles[m] then modeToggles[m]:Set(false) end
             end
+            refreshStatus()
+            task.delay(0.3, function() stopToggle:Set(false) end)
         end,
     })
 
-    local _nuke = ui:AddToggle({
-        Text = "NUKE (click to trigger)",
+    local nukeToggle
+    nukeToggle = ui:AddToggle({
+        Text = "NUKE",
         Default = false,
         Flag = "PF_Nuke",
         SavingEnabled = false,
@@ -242,6 +295,7 @@ local function buildUI(plr)
             local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
             if not hrp then
                 ui:Notify({Title="Nuke", Text="No character found", Duration=2})
+                task.delay(0.3, function() nukeToggle:Set(false) end)
                 return
             end
             local origin = hrp.Position
@@ -256,17 +310,20 @@ local function buildUI(plr)
                 obj.AssemblyAngularVelocity = Vector3.new(math.random(-40,40),math.random(-40,40),math.random(-40,40))
             end
             ui:Notify({Title="Nuke", Text="Boom.", Duration=2})
+            task.delay(0.3, function() nukeToggle:Set(false) end)
         end,
     })
 
     -- -------- Presets --------
     ui:AddSection("Presets")
-    local sliderRefs = {} -- filled below
+    local sliderRefs = {}
     local function refreshSliders()
         for k, s in pairs(sliderRefs) do s:Set(CFG[k]) end
     end
+
+    local presetToggles = {}
     for _, name in ipairs({"default","gentle","violent","fly"}) do
-        local b = ui:AddToggle({
+        presetToggles[name] = ui:AddToggle({
             Text = name:upper().." preset",
             Default = false,
             Flag = "PF_Preset_"..name,
@@ -276,6 +333,7 @@ local function buildUI(plr)
                 applyPreset(name)
                 refreshSliders()
                 ui:Notify({Title="Preset", Text=name:upper().." applied", Duration=2})
+                task.delay(0.3, function() presetToggles[name]:Set(false) end)
             end,
         })
     end
@@ -304,47 +362,6 @@ local function buildUI(plr)
 end
 
 -- ============================================================
--- PHYSICS HELPERS
--- ============================================================
-local function capVel(v)
-    if v.Magnitude > CFG.VelocityCap then return v.Unit * CFG.VelocityCap end
-    return v
-end
-
-local function betterFling(part, fromPos, refVel)
-    local delta = part.Position - fromPos
-    local dist = delta.Magnitude
-    local dir = (dist > 0.1) and delta.Unit or Vector3.new(0,1,0)
-    local relVel = (refVel or Vector3.zero) * 0.5
-    local v = dir * CFG.FlingForce
-        + Vector3.new(0, CFG.FlingUp, 0)
-        + relVel
-    part.AssemblyLinearVelocity = capVel(v)
-    part.AssemblyAngularVelocity = Vector3.new(
-        math.random()*CFG.FlingSpin,
-        math.random()*CFG.FlingSpin,
-        math.random()*CFG.FlingSpin
-    )
-    part.CanCollide = true
-end
-
-local function bringPart(part, hrp)
-    local delta = part.Position - hrp.Position
-    local dist = delta.Magnitude
-    part.CanCollide = true
-    if dist > CFG.TouchDistance then
-        part.AssemblyLinearVelocity = capVel((-delta).Unit * CFG.BringSpeed)
-        if CFG.SnapToTouch and dist < 30 then
-            part.CFrame = CFrame.new(hrp.Position + delta.Unit*CFG.TouchDistance) * part.CFrame.Rotation
-        end
-    else
-        local dir = (dist > 0.05) and delta.Unit or Vector3.new(0,1,0)
-        part.CFrame = CFrame.new(hrp.Position + dir*CFG.TouchDistance) * part.CFrame.Rotation
-        part.AssemblyLinearVelocity = hrp.AssemblyLinearVelocity
-    end
-end
-
--- ============================================================
 -- SETUP
 -- ============================================================
 local MODES = {"fling","bring","fly","multi","others"}
@@ -363,7 +380,12 @@ local function setupPlayer(plr)
         local pg = plr:FindFirstChild("PlayerGui")
         if pg and not pg:FindFirstChild("PartFlingerGui") then
             local old = P[plr]
-            if old and old.gui then old.gui:Destroy() end
+            if old then
+                if old.libGui then old.libGui:Destroy() end
+                if old.ui and type(old.ui.Destroy) == "function" then
+                    pcall(function() old.ui:Destroy() end)
+                end
+            end
             P[plr] = nil
             setupPlayer(plr)
         end
@@ -468,6 +490,11 @@ Players.PlayerAdded:Connect(setupPlayer)
 for _, p in ipairs(Players:GetPlayers()) do setupPlayer(p) end
 Players.PlayerRemoving:Connect(function(p)
     local e = P[p]
-    if e and e.gui then e.gui:Destroy() end
+    if e then
+        if e.libGui then e.libGui:Destroy() end
+        if e.ui and type(e.ui.Destroy) == "function" then
+            pcall(function() e.ui:Destroy() end)
+        end
+    end
     P[p] = nil
 end)
