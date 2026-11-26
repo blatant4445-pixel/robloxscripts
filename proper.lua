@@ -1,4 +1,4 @@
--- PartFlingerServer — LinoriaLib Version (fixed nuke sequence + gui spawn guard)
+-- PartFlingerServer — LinoriaLib Version (debug nuke, no CFrame teleport)
 -- Requires executor context for loadstring/HttpGet.
 
 local Players     = game:GetService("Players")
@@ -22,11 +22,10 @@ local CFG = {
     FlyLift       = 3,
     NukeForce     = 4000,
     VelocityCap   = 2000,
-    -- New nuke sequence tuning
-    NukeOrbitTime = 2.5,   -- seconds of orbit before slam
-    NukeRadius    = 250,   -- radius around click point that gets affected
-    NukeOrbitSpeed = 200,  -- tangential speed while orbiting
-    NukeSlamForce = 8000,  -- downward velocity on slam
+    NukeOrbitTime = 2.5,
+    NukeRadius    = 250,
+    NukeOrbitSpeed = 200,
+    NukeSlamForce = 500,   -- much smaller than before; no teleport
     RequireAdmin  = false,
     Admins        = { --[[ 123456789, ]] },
 }
@@ -38,26 +37,26 @@ local META = {
     FlyForce={50,2000,50}, FlyLift={1,10,1},
     NukeForce={1000,20000,500}, VelocityCap={200,10000,200},
     NukeOrbitTime={0.5,8,0.5}, NukeRadius={50,1000,50},
-    NukeOrbitSpeed={50,1000,50}, NukeSlamForce={1000,30000,500},
+    NukeOrbitSpeed={50,1000,50}, NukeSlamForce={100,5000,100},
 }
 
 local PRESETS = {
     default = {FlingForce=900,FlingUp=250,FlingSpin=8,BringSpeed=80,TouchDistance=1.5,
                MaxParts=120,MaxRange=250,SnapToTouch=true,FlyForce=300,FlyLift=3,
                NukeForce=4000,VelocityCap=2000,NukeOrbitTime=2.5,NukeRadius=250,
-               NukeOrbitSpeed=200,NukeSlamForce=8000},
+               NukeOrbitSpeed=200,NukeSlamForce=500},
     gentle  = {FlingForce=200,FlingUp=80,FlingSpin=2,BringSpeed=40,TouchDistance=3,
                MaxParts=50,MaxRange=150,SnapToTouch=false,FlyForce=150,FlyLift=4,
                NukeForce=1500,VelocityCap=800,NukeOrbitTime=2,NukeRadius=150,
-               NukeOrbitSpeed=100,NukeSlamForce=3000},
+               NukeOrbitSpeed=100,NukeSlamForce=300},
     violent = {FlingForce=2500,FlingUp=800,FlingSpin=30,BringSpeed=200,TouchDistance=0.8,
                MaxParts=300,MaxRange=500,SnapToTouch=true,FlyForce=800,FlyLift=2,
                NukeForce=12000,VelocityCap=5000,NukeOrbitTime=3.5,NukeRadius=500,
-               NukeOrbitSpeed=400,NukeSlamForce=20000},
+               NukeOrbitSpeed=400,NukeSlamForce=2000},
     fly     = {FlingForce=100,FlingUp=50,FlingSpin=0,BringSpeed=100,TouchDistance=2,
                MaxParts=60,MaxRange=200,SnapToTouch=true,FlyForce=350,FlyLift=3,
                NukeForce=2000,VelocityCap=1500,NukeOrbitTime=2,NukeRadius=200,
-               NukeOrbitSpeed=150,NukeSlamForce=5000},
+               NukeOrbitSpeed=150,NukeSlamForce=800},
 }
 
 local MODE_KEYS = {"fling","bring","fly","multi","others"}
@@ -127,7 +126,9 @@ if not Library then error("Could not load LinoriaLib") end
 -- PHYSICS HELPERS
 -- ============================================================
 local function capVel(v)
-    if v.Magnitude > CFG.VelocityCap then return v.Unit * CFG.VelocityCap end
+    local mag = v.Magnitude
+    if mag ~= mag then return Vector3.zero end  -- NaN guard
+    if mag > CFG.VelocityCap then return v.Unit * CFG.VelocityCap end
     return v
 end
 
@@ -179,11 +180,14 @@ local function nearbyUnanchoredParts(origin, radius, limit)
 end
 
 -- ============================================================
--- CURSOR / MOUSE HELPERS
+-- CURSOR HELPERS
 -- ============================================================
 local function getCursorWorldPoint(plr, ignoreList)
     local camera = Workspace.CurrentCamera
-    if not camera then return nil end
+    if not camera then
+        print("[Nuke] No camera")
+        return nil
+    end
 
     local screenPoint
     if UserInput.MouseEnabled then
@@ -192,6 +196,7 @@ local function getCursorWorldPoint(plr, ignoreList)
         local vp = camera.ViewportSize
         screenPoint = Vector2.new(vp.X / 2, vp.Y / 2)
     end
+    print("[Nuke] screen point:", screenPoint)
 
     local ray = camera:ScreenPointToRay(screenPoint.X, screenPoint.Y)
     local params = RaycastParams.new()
@@ -200,25 +205,35 @@ local function getCursorWorldPoint(plr, ignoreList)
     params.IgnoreWater = true
 
     local result = Workspace:Raycast(ray.Origin, ray.Direction * 5000, params)
-    if result and result.Position then return result.Position end
+    if result and result.Position then
+        print("[Nuke] raycast hit:", result.Position, "part:", result.Instance and result.Instance:GetFullName())
+        return result.Position
+    end
+    print("[Nuke] raycast MISS")
+
     local mouse = plr:GetMouse()
-    if mouse and mouse.Hit then return mouse.Hit.Position end
+    if mouse and mouse.Hit then
+        print("[Nuke] using mouse.Hit:", mouse.Hit.Position)
+        return mouse.Hit.Position
+    end
+    print("[Nuke] no fallback hit")
     return nil
 end
 
 -- ============================================================
--- NUKE SEQUENCE (orbit up → slam down)
+-- NUKE SEQUENCE (velocity-only, no CFrame teleport)
 -- ============================================================
--- Per-part orbit state:  { part, angle, radius, height, speed }
+-- Per-part orbit state: { part, center, angle, radius, speed, born, life, state, slamStart }
 local activeNukes = {}
 
 local function startNuke(origin)
     local parts = nearbyUnanchoredParts(origin, CFG.NukeRadius, math.huge)
+    print("[Nuke] found", #parts, "unanchored parts within", CFG.NukeRadius, "of", origin)
     if #parts == 0 then return 0 end
 
-    local orbitTime   = CFG.NukeOrbitTime
-    local orbitSpeed  = CFG.NukeOrbitSpeed
-    local center      = origin + Vector3.new(0, 8, 0) -- lift the orbit center slightly
+    local orbitTime  = CFG.NukeOrbitTime
+    local orbitSpeed = CFG.NukeOrbitSpeed
+    local center     = origin + Vector3.new(0, 10, 0)
 
     for _, part in ipairs(parts) do
         local delta = part.Position - center
@@ -239,12 +254,13 @@ local function startNuke(origin)
             born    = os.clock(),
             life    = orbitTime,
             state   = "orbit",
+            lastPos = part.Position,
         }
     end
+    print("[Nuke] launched", #activeNukes, "orbiters")
     return #parts
 end
 
--- Drive the orbit → slam sequence every physics step
 RunService.Heartbeat:Connect(function(dt)
     if #activeNukes == 0 then return end
     local now = os.clock()
@@ -259,31 +275,39 @@ RunService.Heartbeat:Connect(function(dt)
         end
 
         if n.state == "orbit" then
-            n.angle += n.speed * dt * 2
+            n.angle = n.angle + n.speed * dt
             local t = math.clamp((now - n.born) / n.life, 0, 1)
-            -- spiral upward as the orbit progresses
-            local currentHeight = n.height + 20 * t
-            local offset = Vector3.new(
+            local height = n.height + 15 * t
+            local target = n.center + Vector3.new(
                 math.cos(n.angle) * n.radius,
-                currentHeight,
+                height,
                 math.sin(n.angle) * n.radius
             )
-            local target = n.center + offset
-            part.AssemblyLinearVelocity = (target - part.Position) * 8
+            -- Velocity pulls toward the orbit target, but we do not teleport.
+            local vel = (target - part.Position) * 4
+            if vel.Magnitude > 300 then vel = vel.Unit * 300 end
+            part.AssemblyLinearVelocity = vel
             part.AssemblyAngularVelocity = Vector3.new(n.speed, n.speed, 0)
 
+            -- If part has stopped responding (CFrame unchanged), bail out so
+            -- it does not keep "disappearing" into the void.
+            if (part.Position - n.lastPos).Magnitude < 0.05 and t > 0.2 then
+                print("[Nuke] part unresponsive, removing from orbit:", part:GetFullName())
+                table.remove(activeNukes, i)
+                continue
+            end
+            n.lastPos = part.Position
+
             if t >= 1 then
-                -- switch to slam
                 n.state = "slam"
                 n.slamStart = now
                 part.AssemblyLinearVelocity = Vector3.new(0, -CFG.NukeSlamForce, 0)
-                part.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+                part.AssemblyAngularVelocity = Vector3.zero
+                print("[Nuke] slam:", part:GetFullName())
             end
         elseif n.state == "slam" then
-            -- keep the downward velocity applied for a moment (so it doesn't
-            -- get overwritten by physics), then let it fall naturally
             local elapsed = now - n.slamStart
-            if elapsed < 0.35 then
+            if elapsed < 0.3 then
                 part.AssemblyLinearVelocity = Vector3.new(0, -CFG.NukeSlamForce, 0)
             end
             if elapsed > 1.5 then
@@ -299,7 +323,6 @@ end)
 -- ============================================================
 -- BUILD UI
 -- ============================================================
--- Build UI only once per player even if PlayerAdded re-fires.
 local uiBuilt = {}
 
 local function buildUI(plr)
@@ -323,10 +346,9 @@ local function buildUI(plr)
     local state = {fling=false, bring=false, fly=false, multi=false, others=false}
     local entry = {state=state, target=nil, ui=Window, nukeArmed=false}
 
-    local ctrlLeft  = Tabs.Controls:AddLeftGroupbox('Target')
-    local ctrlRight = Tabs.Controls:AddRightGroupbox('Modes')
-
-    local statusLabel = ctrlLeft:AddLabel('Status: Target = self | idle')
+    -- ===== Status groupbox (isolated so it can't overlap anything) =====
+    local statusBox = Tabs.Controls:AddLeftGroupbox('Status')
+    local statusLabel = statusBox:AddLabel('Target = self | idle')
 
     local function refreshStatus()
         local s = state
@@ -341,10 +363,12 @@ local function buildUI(plr)
                 if s[m] then modeStr = m; break end
             end
         end
-        statusLabel:SetText('Status: Target = ' .. tgt .. ' | ' .. modeStr)
+        statusLabel:SetText('Target = ' .. tgt .. ' | ' .. modeStr)
     end
 
-    ctrlLeft:AddInput('PF_Target', {
+    -- ===== Target groupbox (input only, no label above it) =====
+    local targetBox = Tabs.Controls:AddRightGroupbox('Target')
+    targetBox:AddInput('PF_Target', {
         Default = '',
         Numeric = false,
         Finished = true,
@@ -357,6 +381,8 @@ local function buildUI(plr)
         end,
     })
 
+    -- ===== Modes =====
+    local modeBox = Tabs.Controls:AddLeftGroupbox('Modes')
     local switching = false
     local function onMode(k, newVal)
         if switching then return end
@@ -383,7 +409,7 @@ local function buildUI(plr)
             multi = 'Apply fling/bring/fly to EVERYONE (including you)',
             others = 'Apply fling/bring/fly to everyone EXCEPT you',
         })[k] or ''
-        ctrlRight:AddToggle('PF_Mode_' .. k, {
+        modeBox:AddToggle('PF_Mode_' .. k, {
             Text = k:upper(),
             Default = false,
             Tooltip = tooltip,
@@ -391,7 +417,8 @@ local function buildUI(plr)
         Toggles['PF_Mode_' .. k]:OnChanged(function(v) onMode(k, v) end)
     end
 
-    local actionBox = Tabs.Controls:AddLeftGroupbox('Actions')
+    -- ===== Actions =====
+    local actionBox = Tabs.Controls:AddRightGroupbox('Actions')
 
     actionBox:AddButton('STOP ALL', function()
         for _, m in ipairs(MODE_KEYS) do
@@ -405,16 +432,43 @@ local function buildUI(plr)
 
     local nukeToggle
     nukeToggle = actionBox:AddToggle('PF_NukeArmed', {
-        Text = 'NUKE ARM (click a part in the world)',
+        Text = 'NUKE ARM',
         Default = false,
-        Tooltip = 'While armed, click any part in the world. Nearby unanchored parts orbit the spot for a few seconds, then slam down.',
+        Tooltip = 'While armed, click any part in the world. Nearby parts orbit, then slam down.',
         Callback = function(v)
             entry.nukeArmed = v
+            print("[Nuke] armed =", v)
             if v then Library:Notify('Nuke armed — click a part', 2) end
         end,
     })
 
+    -- Primary click detector: Mouse.Button1Down (fires reliably in executors)
+    local mouse = plr:GetMouse()
+    if mouse then
+        mouse.Button1Down:Connect(function()
+            print("[Nuke] Button1Down fired, armed =", entry.nukeArmed)
+            if not entry.nukeArmed then return end
+
+            local myChar = plr.Character
+            local origin = getCursorWorldPoint(plr, myChar and {myChar} or {})
+            if not origin then
+                Library:Notify('Nuke: could not resolve world point', 2)
+                return
+            end
+
+            local count = startNuke(origin)
+            Library:Notify(string.format('Nuke: %d parts orbiting', count), 2)
+
+            entry.nukeArmed = false
+            if nukeToggle then nukeToggle:SetValue(false) end
+        end)
+    else
+        print("[Nuke] player:GetMouse() returned nil — will rely on InputBegan only")
+    end
+
+    -- Fallback: InputBegan in case Button1Down doesn't fire
     UserInput.InputBegan:Connect(function(input, processed)
+        print("[Nuke] InputBegan: type =", input.UserInputType.Name, "| processed =", processed, "| armed =", entry.nukeArmed)
         if processed then return end
         if not entry.nukeArmed then return end
         if input.UserInputType ~= Enum.UserInputType.MouseButton1
@@ -434,6 +488,7 @@ local function buildUI(plr)
         if nukeToggle then nukeToggle:SetValue(false) end
     end)
 
+    -- ===== Presets =====
     local presetBox = Tabs.Presets:AddLeftGroupbox('Presets')
     local sliderRefs = {}
 
@@ -445,6 +500,7 @@ local function buildUI(plr)
         end)
     end
 
+    -- ===== Config =====
     local configBox = Tabs.Config:AddLeftGroupbox('Config Sliders')
 
     for _, key in ipairs({
@@ -469,6 +525,7 @@ local function buildUI(plr)
     end
 
     P[plr] = entry
+    refreshStatus()
     return entry
 end
 
@@ -480,8 +537,6 @@ local function setupPlayer(plr)
     buildUI(plr)
 end
 
--- Only wire up new players. Do NOT re-call for existing players,
--- and guard against double-builds (the Ctrl-spam glitch).
 Players.PlayerAdded:Connect(setupPlayer)
 if #Players:GetPlayers() > 0 then
     for _, p in ipairs(Players:GetPlayers()) do setupPlayer(p) end
