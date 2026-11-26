@@ -116,10 +116,10 @@ local function buildUI(plr)
     if old then old:Destroy() end
 
     -- Build a fresh ScreenGui container for the library
-    local gui = Instance.new("ScreenGui")
-    gui.Name = "PartFlingerGui"
-    gui.ResetOnSpawn = false
-    gui.Parent = pg
+    -- local gui = Instance.new("ScreenGui")
+    -- gui.Name = "PartFlingerGui"
+    -- gui.ResetOnSpawn = false
+    -- gui.Parent = pg
 
     local ui = UILibrary.Main.new({
         TitleText = "PART FLINGER",
